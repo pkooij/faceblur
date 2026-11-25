@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "faceblur"
+version = "0.1.0"
+description = "High-precision face blurring for egocentric robot video, built for H100-class GPUs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "torch>=2.5",
+    "torchvision>=0.20",
+    "tensorrt-cu13>=11",
+    "PyNvVideoCodec>=2.0",
+    "av>=14",
+    "numpy",
+    "opencv-python-headless",
+    "transformers>=4.50",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+export = ["ultralytics", "onnx", "onnxslim"]
+test = ["pytest"]
+
+[project.scripts]
+faceblur = "faceblur.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["faceblur*"]
+
+[tool.setuptools.package-data]
+faceblur = ["assets/*.npz"]
+
+[tool.ruff]
+line-length = 130
