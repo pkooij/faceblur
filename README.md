@@ -59,6 +59,43 @@ The default recipe trades recall for precision. It removes about 98 % of the det
 wheels, toys) but also misses many small or partly visible faces. Lower `--ver-thr` and `--det-thr` if recall matters
 more for your data, and spot-check results with `faceblur check`.
 
+## Keyframe scan: find what to blur across a whole dataset
+
+`faceblur run` decodes every frame with NVDEC. To find *which* files and frames contain faces across a large
+collection, `faceblur scan` looks at keyframes only and decodes them on the CPU, where a node has far more decode
+capacity than in its NVDECs:
+
+```
+ faceblur units                                faceblur scan --gpus 0,…,7
+ ──────────────                                ──────────────────────────────────────────────────────────────
+ read each file's MP4 sample table      ──▶    ~10 CPU decoder processes per GPU: claim the next unit from a
+ (a few KB, local or Hub range read),          node-wide counter, range-read its keyframes, decode with
+ split into ≤ 2,000-keyframe units,            libavcodec into page-locked shared memory  ──▶  per GPU:
+ largest first                                 YOLOv11n-face TRT (batch 128) + SigLIP2 verifier (batch ≥ 512)
+```
+
+With closed 8-frame GOPs that samples every 8th frame for an eighth of the decode work. Files can be local paths or
+Hub files, `hf://datasets/<org>/<repo>/<path>`, streamed with HTTP range requests (no download). Splitting long files
+into units keeps every decoder busy until the end, so all GPUs finish within seconds of each other.
+
+```bash
+faceblur units files.txt units.jsonl                   # index pass: 701 Hub files in 41 s
+faceblur scan units.jsonl --report scan.jsonl --gpus 0,1,2,3,4,5,6,7
+```
+
+The report has one line per file with every detection above the detector threshold as
+`[frame, x1, y1, x2, y2, detector score, verifier score]`, so the verifier threshold can be chosen afterwards.
+
+One 8×H100 node (92 CPU cores, 10 decoders per GPU), mixed robot datasets streamed from the Hub:
+
+| data | video frames / s per node |
+|---|---|
+| 701 files from 108 datasets, 15.6 M frames, keyframe every 4.9 frames on average | 99,000 (157 s wall, incl. 53 s startup) |
+| egocentric video, 512×288, keyframe every 8 frames | 271,000 |
+
+The scan is bound by CPU decoding (about 330–480 keyframes per second per core), not by the GPUs. A face that is
+visible only between two keyframes (under about a quarter of a second at 30 fps) is not seen by the scan.
+
 ## Install
 
 Needs an NVIDIA GPU with NVDEC (tested on H100), a CUDA 13 driver and Python ≥ 3.10.
@@ -131,8 +168,11 @@ faceblur/
   splice.py     copy / GOP splice / full re-encode writers and H.264 bitstream helpers
   verify.py     output checks used by `faceblur check`
   prepare.py    model download and conversion
+  units.py      index pass for the keyframe scan: MP4 sample tables → keyframe-range work units
+  scan.py       keyframe scan: CPU decoder processes, shared-memory hand-off, GPU detector + verifier
+  _vendor/      MP4 index reader and HTTP range fetcher from LeRobot's streaming module (Apache-2.0)
   assets/       verifier probe weights
-tests/          CPU-only tests of the bitstream and splice paths
+tests/          CPU-only tests of the bitstream, splice and keyframe-scan paths
 ```
 
 ## Models and licences

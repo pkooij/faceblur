@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "faceblur"
-version = "0.1.0"
+version = "0.2.0"
 description = "High-precision face blurring for egocentric robot video, built for H100-class GPUs"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,6 +19,8 @@ dependencies = [
     "opencv-python-headless",
     "transformers>=4.50",
     "huggingface_hub",
+    "httpx",
+    "fsspec",
 ]
 
 [project.optional-dependencies]
@@ -36,3 +38,4 @@ faceblur = ["assets/*.npz"]
 
 [tool.ruff]
 line-length = 130
+extend-exclude = ["faceblur/_vendor"]
