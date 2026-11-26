@@ -230,15 +230,3 @@ pip install "faceblur[test] @ git+https://github.com/pkooij/faceblur"
 pytest tests
 ```
 
-## Models and licences
-
-Code in this repository is Apache-2.0. Downloaded models have their own licences:
-
-| model | source | licence |
-|---|---|---|
-| YOLOv11n-face | [akanametov/yolo-face](https://github.com/akanametov/yolo-face) release 1.0.0 (trained with Ultralytics) | GPL-3.0 (Ultralytics: AGPL-3.0) |
-| SigLIP2 so400m/16 @ 256 | [google/siglip2-so400m-patch16-256](https://huggingface.co/google/siglip2-so400m-patch16-256) | Apache-2.0 |
-| verifier probe | `faceblur/assets/verifier-so400m.npz`: logistic regression on SigLIP2 features (egocentric crops + WIDER FACE) | Apache-2.0 |
-
-Check that the detector's licence fits your use before deploying it. WIDER FACE (used only to train the probe) is
-distributed under CC BY-NC-ND.
