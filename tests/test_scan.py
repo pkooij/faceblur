@@ -28,7 +28,22 @@ def test_bad_file_becomes_whole_file_unit(tmp_path):
     bad = tmp_path / "bad.mp4"
     bad.write_bytes(b"not an mp4")
     us, stats = units.build_units([str(bad)], chunk=3, threads=1)
-    assert stats["index_errors"] == 1 and us == [{"fid": 0, "path": str(bad), "lo": 0, "hi": -1, "first": True}]
+    assert stats["index_errors"] == 1 and us == [{"fid": 0, "path": str(bad), "lo": 0, "hi": -1, "step": 1, "first": True}]
+
+
+def test_key_stride_and_annexb(tmp_path):
+    src = str(tmp_path / "src.mp4")
+    _clip(src)
+    us, stats = units.build_units([src], chunk=2, threads=1, key_stride=2, stride_max_gop=12.0)
+    assert stats["index_errors"] == 0 and stats["keyframes"] == (N // 8) // 2
+    seen = []
+    for u in us:
+        idx, sel, roffs, sizes, data = scan.load_unit(u)
+        pkts = scan.avcc_unit_to_annexb(idx.stsd_body, sel, roffs, sizes, data)
+        assert len(pkts) == len(sel) and pkts[0][1].startswith(b"\x00\x00\x00\x01")
+        for pres, _ in scan.decode_unit(idx, sel, roffs, sizes, data):
+            seen.append(pres)
+    assert sorted(seen) == list(range(0, N, 16))
 
 
 def test_claim_counter(tmp_path):

@@ -60,32 +60,47 @@ def sync_samples(idx) -> np.ndarray:
     return s if len(s) else np.arange(len(idx.sample_sizes))
 
 
-def build_units(paths: list[str], chunk: int = 2000, threads: int = 64) -> tuple[list[dict], dict]:
-    """Split every file into units of at most `chunk` keyframes. A file whose index cannot be read becomes one
-    whole-file unit (hi = -1) so the scan reports its error instead of silently skipping it."""
+def build_units(paths: list[str], chunk: int = 2000, threads: int = 64, key_stride: int = 1,
+                stride_max_gop: float = 12.0) -> tuple[list[dict], dict]:
+    """Split every file into units of at most `chunk` decoded keyframes. A file whose index cannot be read becomes one
+    whole-file unit (hi = -1) so the scan reports its error instead of silently skipping it.
+
+    When `key_stride > 1`, files whose average GOP length (frames / keyframes) is at most `stride_max_gop` decode
+    every `key_stride`-th keyframe; sparser files keep stride 1.
+    """
     t0 = time.time()
 
     def info(fp):
         fid, path = fp
         try:
-            return fid, path, len(sync_samples(index(path, parts=1)[1])), None
+            idx = index(path, parts=1)[1]
+            return fid, path, len(sync_samples(idx)), len(idx.sample_sizes), None
         except Exception as e:  # noqa: BLE001 - reported, not fatal
-            return fid, path, -1, repr(e)[:200]
+            return fid, path, -1, 0, repr(e)[:200]
 
     with ThreadPoolExecutor(threads) as ex:
         res = list(ex.map(info, enumerate(paths)))
     units, errors = [], []
-    for fid, path, nk, err in res:
+    decoded_kfs = []
+    for fid, path, nk, nf, err in res:
         if nk < 0:
             errors.append({"src": path, "error": err})
-            units.append({"fid": fid, "path": path, "lo": 0, "hi": -1, "first": True})
+            units.append({"fid": fid, "path": path, "lo": 0, "hi": -1, "step": 1, "first": True})
             continue
-        for lo in range(0, max(nk, 1), chunk):
-            units.append({"fid": fid, "path": path, "lo": lo, "hi": min(nk, lo + chunk), "first": lo == 0})
-    units.sort(key=lambda u: -(u["hi"] - u["lo"]) if u["hi"] >= 0 else -10**9)
-    nks = sorted(r[2] for r in res if r[2] >= 0) or [0]
+        gop = (nf / nk) if nk else 0.0
+        step = key_stride if (key_stride > 1 and 0 < gop <= stride_max_gop) else 1
+        span = chunk * step
+        for lo in range(0, max(nk, 1), span):
+            u = {"fid": fid, "path": path, "lo": lo, "hi": min(nk, lo + span), "first": lo == 0}
+            if step > 1:
+                u["step"] = step
+            units.append(u)
+        decoded_kfs.append((nk + step - 1) // step if nk else 0)
+    units.sort(key=lambda u: -((u["hi"] - u["lo"] + u.get("step", 1) - 1) // u.get("step", 1)) if u["hi"] >= 0 else -10**9)
+    nks = sorted(decoded_kfs) or [0]
     stats = {"files": len(paths), "units": len(units), "index_errors": len(errors), "index_s": round(time.time() - t0, 1),
-             "keyframes": int(sum(nks)), "keyframes_max": nks[-1], "keyframes_median": nks[len(nks) // 2]}
+             "keyframes": int(sum(nks)), "keyframes_max": nks[-1], "keyframes_median": nks[len(nks) // 2],
+             "key_stride": key_stride}
     return units, {**stats, "errors": errors[:20]}
 
 

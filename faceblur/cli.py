@@ -5,7 +5,8 @@
   faceblur check SRC DST          verify outputs: frame counts, untouched frames bit-exact, blurred frames changed
   faceblur prepare                fetch and convert the models into $FACEBLUR_MODELS
   faceblur units LIST OUT         index pass for `scan`: split files (local or hf://datasets/...) into keyframe units
-  faceblur scan UNITS --report R  keyframe-only face scan with CPU decoders, one process per GPU (finds what to blur)
+  faceblur scan UNITS --report R  keyframe-only face scan (NVDEC and/or CPU decode, GPU detect + verify)
+  faceblur apply SCAN DST         targeted Pass 2: blur only ±pad GOPs around verified scan hits, splice bit-exact
 """
 from __future__ import annotations
 
@@ -82,15 +83,20 @@ def cmd_prepare(a):
 def cmd_units(a):
     from .units import build_units, write_units
     paths = [x.strip() for x in open(a.list) if x.strip()]
-    units, stats = build_units(paths, chunk=a.chunk, threads=a.threads)
+    units, stats = build_units(paths, chunk=a.chunk, threads=a.threads, key_stride=a.key_stride,
+                               stride_max_gop=a.stride_max_gop)
     write_units(units, a.out)
     print(json.dumps(stats), flush=True)
     return 1 if stats["index_errors"] else 0
 
 
 def _scan_opts(a) -> list[str]:
-    return ["--decoders", str(a.decoders), "--gpu-threads", str(a.gpu_threads), "--parts", str(a.parts),
-            "--fetchers", str(a.fetchers), "--prefetch", str(a.prefetch), "--det-thr", str(a.det_thr), "--ver-thr", str(a.ver_thr)]
+    opts = ["--nvdec", str(a.nvdec), "--decoders", str(a.decoders), "--gpu-threads", str(a.gpu_threads),
+            "--parts", str(a.parts), "--fetchers", str(a.fetchers), "--prefetch", str(a.prefetch),
+            "--det-thr", str(a.det_thr), "--ver-thr", str(a.ver_thr)]
+    if a.no_skip_loop_filter:
+        opts.append("--no-skip-loop-filter")
+    return opts
 
 
 def cmd_scan(a):
@@ -113,12 +119,33 @@ def cmd_scan(a):
             print(json.dumps({"merged": a.report, **tot}), flush=True)
             return rc or (1 if tot["errors"] else 0)
         from .scan import scan
-        out = scan(a.units, a.report, claim, decoders=a.decoders, gpu_threads=a.gpu_threads, parts=a.parts, fetchers=a.fetchers,
-                   prefetch=a.prefetch, det_thr=a.det_thr, ver_thr=a.ver_thr, log=lambda d: print(json.dumps(d), flush=True))
+        out = scan(a.units, a.report, claim, decoders=a.decoders, gpu_threads=a.gpu_threads, nvdec=a.nvdec,
+                   parts=a.parts, fetchers=a.fetchers, prefetch=a.prefetch, det_thr=a.det_thr, ver_thr=a.ver_thr,
+                   skip_loop_filter=not a.no_skip_loop_filter, log=lambda d: print(json.dumps(d), flush=True))
         return 1 if out["errors"] else 0
     finally:
         if own_claim:
             os.remove(claim)
+
+
+def cmd_apply(a):
+    if a.gpus:
+        rc = _multi_gpu(a)
+        if a.report:
+            gpus = a.gpus.split(",")
+            parts = [f"{a.report}.gpu{g}" for g in gpus]
+            with open(a.report + ".tmp", "w") as out:
+                for p in parts:
+                    if os.path.exists(p):
+                        out.write(open(p).read())
+            os.replace(a.report + ".tmp", a.report)
+        return rc
+    from .apply import apply_scan
+    tot = apply_scan(a.scan_report, a.dst, _recipe(a), pad_gops=a.pad_gops, src_root=a.src_root,
+                     cache_dir=a.cache_dir, workers=a.workers, encoders=a.encoders, parts=a.parts,
+                     batch=a.batch, shard=a.shard, overwrite=a.overwrite, report=a.report)
+    print(json.dumps(tot, indent=1), flush=True)
+    return 1 if tot["errors"] else 0
 
 
 def main(argv=None) -> int:
@@ -152,25 +179,47 @@ def main(argv=None) -> int:
     p = sub.add_parser("units", help="split files into keyframe-range work units for `scan`")
     p.add_argument("list", help="text file: one local path or hf://datasets/<org>/<repo>/<file> per line")
     p.add_argument("out", help="units JSONL")
-    p.add_argument("--chunk", type=int, default=2000, help="keyframes per unit")
+    p.add_argument("--chunk", type=int, default=2000, help="decoded keyframes per unit")
     p.add_argument("--threads", type=int, default=64, help="parallel index reads")
-    p = sub.add_parser("scan", help="keyframe-only face scan (CPU decode, GPU detect + verify)")
+    p.add_argument("--key-stride", type=int, default=1, help="decode every Nth keyframe on files with GOP <= --stride-max-gop")
+    p.add_argument("--stride-max-gop", type=float, default=12.0, help="only apply --key-stride when mean GOP <= this")
+    p = sub.add_parser("scan", help="keyframe-only face scan (NVDEC and/or CPU decode, GPU detect + verify)")
     p.add_argument("units", help="JSONL from `faceblur units`")
     p.add_argument("--report", required=True, help="JSONL, one line per file with every detection")
     p.add_argument("--gpus", help="comma-separated GPU ids: one process per GPU sharing one work queue")
-    p.add_argument("--decoders", type=int, default=10, help="CPU decoder processes per GPU (about CPUs / GPUs)")
-    p.add_argument("--gpu-threads", type=int, default=2, help="detector threads per GPU")
+    p.add_argument("--nvdec", type=int, default=8, help="hardware NVDEC keyframe worker threads per GPU (0 disables NVDEC)")
+    p.add_argument("--decoders", type=int, default=0, help="parallel CPU decoder processes per GPU (0 = NVDEC only)")
+    p.add_argument("--gpu-threads", type=int, default=2, help="detector threads per GPU for CPU-decoded frames")
     p.add_argument("--parts", type=int, default=4, help="parallel HTTP range requests per Hub read")
-    p.add_argument("--fetchers", type=int, default=2, help="prefetch threads per decoder")
-    p.add_argument("--prefetch", type=int, default=2, help="units read ahead per decoder")
+    p.add_argument("--fetchers", type=int, default=2, help="prefetch threads per worker")
+    p.add_argument("--prefetch", type=int, default=2, help="units read ahead per worker")
     p.add_argument("--det-thr", type=float, default=0.4)
     p.add_argument("--ver-thr", type=float, default=0.8, help="only used for the face counts; all scores are reported")
+    p.add_argument("--no-skip-loop-filter", action="store_true", help="disable skip_loop_filter=all on CPU decode path")
     p.add_argument("--claim", help=argparse.SUPPRESS)
+    p = sub.add_parser("apply", help="targeted Pass 2: blur only ±pad GOPs around verified scan hits")
+    p.add_argument("scan_report", help="JSONL written by `faceblur scan`")
+    p.add_argument("dst", help="output directory for modified MP4s")
+    p.add_argument("--pad-gops", type=int, default=1, help="neighboring GOPs to decode/check on each side of a hit")
+    p.add_argument("--det-thr", type=float, default=0.4)
+    p.add_argument("--ver-thr", type=float, default=0.8)
+    p.add_argument("--src-root", help="root prefix to strip for local paths when mirroring into DST")
+    p.add_argument("--cache-dir", help="optional dir to keep downloaded Hub sources (e.g. for `faceblur check`)")
+    p.add_argument("--workers", type=int, default=4, help="GPU worker threads per GPU")
+    p.add_argument("--encoders", type=int, default=None, help="CPU processes for GOP splice / re-encode")
+    p.add_argument("--parts", type=int, default=4, help="parallel HTTP range requests per Hub download")
+    p.add_argument("--batch", type=int, default=128)
+    p.add_argument("--report", help="JSONL report compatible with `faceblur check`")
+    p.add_argument("--gpus", help="comma-separated GPU ids: one process per GPU, hit files sharded")
+    p.add_argument("--shard", help=argparse.SUPPRESS)
+    p.add_argument("--overwrite", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd == "units":
         return cmd_units(a)
     if a.cmd == "scan":
         return cmd_scan(a)
+    if a.cmd == "apply":
+        return cmd_apply(a)
     if a.cmd == "run":
         return cmd_run(a)
     if a.cmd == "bench":

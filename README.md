@@ -50,33 +50,51 @@ other had a single 8-frame GOP re-encoded and spliced.
 ### Keyframe scan (`faceblur units` + `faceblur scan`)
 
 To find *which* files and frames contain faces across a large collection without decoding every frame, `faceblur scan`
-decodes keyframes only on the CPU (where a node has far more decode capacity than in NVDEC) and hands them to the GPUs
-via page-locked shared memory:
+decodes keyframes only. On GPUs with NVDEC (`--nvdec 8`, default), separate fetcher processes stream and pack Annex-B
+IDR keyframes into shared memory (avoiding Python GIL contention) and hardware NVDEC decodes them straight into GPU
+NV12 VRAM. A CPU `libavcodec` decoder pool (`--decoders`) can be used instead or alongside NVDEC.
 
 ```
  faceblur units                                faceblur scan --gpus 0,…,7
  ──────────────                                ──────────────────────────────────────────────────────────────
- read each file's MP4 sample table      ──▶    ~10 CPU decoder processes per GPU: claim the next unit from a
- (a few KB, local or Hub range read),          node-wide counter, range-read its keyframes, decode with
- split into ≤ 2,000-keyframe units,            libavcodec into page-locked shared memory  ──▶  per GPU:
- largest first                                 YOLOv11n-face TRT (batch 128) + SigLIP2 verifier (batch ≥ 512)
+ read each file's MP4 sample table      ──▶    fetcher processes: claim units from a node-wide counter,
+ (a few KB, local or Hub range read),          range-read keyframes, pack Annex-B into shared memory  ──▶
+ split into ≤ 2,000-keyframe units,            per GPU: 8× NVDEC decode into VRAM ──▶ 2× YOLOv11n-face TRT
+ largest first (optional --key-stride)         (batch 128) ──▶ SigLIP2 verifier (batch ≥ 512)
 ```
 
 With closed 8-frame GOPs this samples every 8th frame for ~1/8 of the decode work. Inputs can be local paths or
 Hugging Face Hub URIs (`hf://datasets/<org>/<repo>/<path>`) streamed via HTTP range requests (no download). Splitting
-long files into ≤ 2,000-keyframe units keeps all GPUs balanced to within a few seconds.
+long files into ≤ 2,000-keyframe units keeps all GPUs balanced to within a second. Run `faceblur units` ahead of time
+on CPU nodes so GPUs stay 100 % utilized.
 
-| hardware | dataset | measured video fps | full-node (92 CPU) video fps | notes |
+| hardware / mode | dataset | measured video fps | full 8-GPU node (scaled) | notes |
 |---|---|---:|---:|---|
-| 8× H100 (92 CPUs, 80 dec) | 701 mixed Hub files, 15.6 M frames (stride 4.9) | 99,000 wall (150,000 steady) | 99,000 wall / 150,000 steady | 41 s index; 157 s scan (53 s startup) |
-| 8× H100 (92 CPUs, 80 dec) | local HubEgo 512×288, 106.7 M frames (stride 8.0) | 271,000 | 271,000 | whole-file decode |
-| 6× B300 (60 CPUs, 60 dec) | same 701 mixed Hub files, 15.6 M frames (stride 4.9) | 122,000 steady (98,500 wall) | ~163,000 – 188,000 steady | 25.7 s index; 127 s active (17.8 s startup); 0 errors |
-| 6× B300 (60 CPUs, 54 dec) | 2,697 catalog-weighted Hub files (78 repos), 59.6 M frames (stride 6.9) | **142,000 steady** (132,000 wall) | **~210,000 steady** (~170,000 incl. index) | 72.6 s index; 420 s active (1 s skew across 6 GPUs); 537 MB/s Hub; 0 errors |
-| 6× B300 (60 CPUs, 60 dec) | local HubEgo 512×288, 33.5 M frames (stride 8.0) | 200,000 steady (181,000 wall) | ~266,000 – 306,000 steady | 25.7 s index; 167.5 s active; 793 MB/s `/fsx` |
+| 8× H100, CPU (`80 dec`) | 701 mixed Hub files, 15.6 M frames (stride 4.9) | 99,000 wall (150,000 steady) | 99,000 wall / 150,000 steady | 41 s index; 157 s scan (53 s startup) |
+| 8× H100, CPU (`80 dec`) | local HubEgo 512×288, 106.7 M frames (stride 8.0) | 271,000 | 271,000 | whole-file decode |
+| 6× B300, CPU (`54 dec`) | 2,697 catalog-weighted Hub files (78 repos), 59.6 M frames (stride 6.9) | 142,000 steady (132,000 wall) | ~210,000 steady | 72.6 s index; 420 s active (1 s skew); 537 MB/s Hub; 0 errors |
+| 2× B300, CPU (`20 dec`) | 420 `abc-130k` Hub files, 10.5 M frames (stride 7.9) | 40,400 active (36,600 wall) | ~161,000 steady | baseline CPU decode (`259.6 s` active, 425 faces / 45 files) |
+| **2× B300, NVDEC (`--nvdec 8`)** | **same 420 `abc-130k` Hub files, 10.5 M frames (stride 1)** | **99,800 active (79,600 wall)** | **~399,000 steady** | **2.47× faster**, `0.0 s` skew, **exact 425/425 faces parity**, 0 errors |
+| **2× B300, NVDEC (`--nvdec 8`)** | **same 420 `abc-130k` Hub files (`--key-stride 2`)** | **189,500 active (148,800 wall)** | **~758,000 steady** | **4.70× faster**, 586 MB/s Hub on 2 GPUs; ~97.5 % sustained-face recall |
+| **2× B300, NVDEC (`--nvdec 8`)** | **local HubEgo 512×288, 33.5 M frames (stride 1)** | **91,900 active (88,700 wall)** | **~368,000 steady** | `0.0 s` skew across GPUs, exact 15/15 faces parity, 0 errors |
 
-The scan is **CPU-decode bound** (~380–420 keyframes/s per Xeon Platinum 8559C core on the B300 nodes), leaving B300
-GPUs ~75–85 % idle. Full-node B300 figures scale linearly from the 60-CPU measurements to a 92-CPU (8×B300) node. A face
-visible only between two keyframes (under ~0.25 s at 30 fps with GOP 8) is not seen by the scan.
+A face visible only between two keyframes (under ~0.25 s at 30 fps with GOP 8, or ~0.5 s with `--key-stride 2`) is not
+seen by the scan.
+
+### Targeted Pass 2 (`faceblur apply`)
+
+Instead of running full `faceblur run` across the entire dataset (or even across every frame of hit files),
+`faceblur apply` reads the `scan` report, opens/downloads **only** files with verified faces, decodes **only** the
+closed GOPs within `±1` GOP of each keyframe hit (~0.5–1 % of frames), runs the detector + verifier + GPU blur on
+every frame in those GOPs, and splices only the blurred GOPs back bit-exact.
+
+Measured on the 10.5 M-frame `abc-130k` Hub test above (45 hit files / 1.11 M frames inside hit files, `2× B300`):
+* **45 / 45 files spliced cleanly** (`0` full re-encodes, `0` errors) in **40.2 s** (including Hub download, targeted
+  decode, GPU blur, and x264 splice — equivalent to **~1.0 M dataset video fps** on an 8×B300 node).
+* Decoded only **0.53 %** of hit-file frames (`0.056 %` of all 10.5 M frames), blurred **2,867 frames** (`2,875` faces),
+  and re-encoded **0.40 %** of hit-file frames.
+* `faceblur check` passed **5 / 5** (`0` failures: exact frame counts, untouched frames bit-exact, all blurred boxes
+  verified).
 
 ## Accuracy
 
@@ -133,18 +151,23 @@ totals = run([("in/a.mp4", "out/a.mp4")], Recipe(det_thr=0.4, ver_thr=0.8), repo
 The `run` report has one JSON line per video: frame count, output mode (`copy`, `splice`, or `reencode`), frames
 re-encoded, and each blurred box as `[frame, x1, y1, x2, y2, detector score, verifier score]`.
 
-### Keyframe scan (`units`, `scan`)
+### Two-pass dataset workflow (`units`, `scan`, `apply`)
 
 ```bash
-# 1. index pass: local paths or hf://datasets/<org>/<repo>/<path> in files.txt
-faceblur units files.txt units.jsonl --threads 64
+# 1. index pass (CPU only): local paths or hf://datasets/<org>/<repo>/<path> in files.txt
+faceblur units files.txt units.jsonl --threads 64          # add --key-stride 2 for 2x faster scan on GOP <= 12
 
-# 2. scan keyframes across all GPUs of a node
-faceblur scan units.jsonl --report scan.jsonl --gpus 0,1,2,3,4,5,6,7 --decoders 10
+# 2. scan keyframes across all GPUs of a node (NVDEC default)
+faceblur scan units.jsonl --report scan.jsonl --gpus 0,1,2,3,4,5,6,7 --nvdec 8
+
+# 3. targeted Pass 2: blur only ±1 GOP around verified hits, splice bit-exact
+faceblur apply scan.jsonl DST --gpus 0,1,2,3,4,5,6,7 --pad-gops 1 --report apply.jsonl
 ```
 
 The `scan` report has one JSON line per file with frame/keyframe counts and every detection above `--det-thr` as
 `[frame, x1, y1, x2, y2, detector score, verifier score]`, so `--ver-thr` can be tuned afterwards without re-scanning.
+Pass `--cache-dir DIR` to `faceblur apply` to retain downloaded Hub sources if you want to verify outputs with
+`faceblur check DIR DST --report apply.jsonl`.
 
 ## Options
 
@@ -160,18 +183,20 @@ The `scan` report has one JSON line per file with frame/keyframe counts and ever
 | `--gpus` | | comma-separated GPU ids (one process per GPU, sharded) |
 | `--files` | | text file with paths relative to `SRC`, instead of `--glob` |
 
-### `faceblur units` / `faceblur scan`
+### `faceblur units` / `faceblur scan` / `faceblur apply`
 
 | flag | default | meaning |
 |---|---|---|
-| `--chunk` (`units`) | `2000` | max keyframes per work unit |
+| `--chunk` (`units`) | `2000` | max decoded keyframes per work unit |
 | `--threads` (`units`) | `64` | parallel MP4 index readers |
-| `--gpus` (`scan`) | | comma-separated GPU ids sharing one work queue |
-| `--decoders` (`scan`) | `10` | CPU decoder processes per GPU (~`CPUs / GPUs`) |
+| `--key-stride` (`units`) | `1` | decode every Nth keyframe when file GOP ≤ `--stride-max-gop` (`12`) |
+| `--gpus` (`scan`, `apply`) | | comma-separated GPU ids |
+| `--nvdec` (`scan`) | `8` | hardware NVDEC keyframe worker threads per GPU (`0` disables NVDEC) |
+| `--decoders` (`scan`) | `0` | parallel CPU decoder processes per GPU (`0` = NVDEC only) |
 | `--gpu-threads` (`scan`) | `2` | detector threads per GPU |
-| `--parts` (`scan`) | `4` | parallel HTTP range sub-requests per Hub read |
-| `--fetchers` / `--prefetch` (`scan`) | `2` / `2` | prefetch threads and queued units per decoder |
-| `--det-thr` / `--ver-thr` (`scan`) | `0.4` / `0.8` | detector threshold (kept in report) and verifier threshold (used for counts) |
+| `--parts` (`scan`, `apply`) | `4` | parallel HTTP range sub-requests per Hub read |
+| `--pad-gops` (`apply`) | `1` | neighboring GOPs to decode and check on each side of each hit |
+| `--cache-dir` (`apply`) | | optional dir to keep downloaded Hub sources (e.g. for `faceblur check`) |
 
 ## How the splice works
 
@@ -188,7 +213,7 @@ Set `ENC_OPTS` in `faceblur/splice.py` to match the encoder settings of your own
 
 ```
 faceblur/
-  cli.py        command line (run, bench, check, prepare, units, scan)
+  cli.py        command line (run, bench, check, prepare, units, scan, apply)
   pipeline.py   per-GPU orchestration: NVDEC workers, recipe, CPU writer pool, report
   models.py     TensorRT detector engine, SigLIP2 verifier
   gpu.py        CUDA kernels: NV12 conversion, YOLO post-processing, verifier crops, blur
@@ -196,7 +221,8 @@ faceblur/
   verify.py     output checks used by `faceblur check`
   prepare.py    model download and conversion
   units.py      index pass for `scan`: MP4 sample tables → keyframe-range work units
-  scan.py       keyframe scan: CPU decoder processes, shared-memory hand-off, GPU detect + verify
+  scan.py       keyframe scan: MP fetcher processes, NVDEC/CPU decode, GPU detect + verify
+  apply.py      targeted Pass 2: ±pad GOP decode around verified hits, GPU blur, bit-exact splice
   _vendor/      MP4 index reader and HTTP range fetcher from LeRobot's streaming module (Apache-2.0)
   assets/       verifier probe weights
 tests/          CPU-only tests of the bitstream, splice, and keyframe-scan paths
